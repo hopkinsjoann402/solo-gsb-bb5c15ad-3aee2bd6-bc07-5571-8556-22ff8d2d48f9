@@ -4,7 +4,9 @@
 接收待解包条目的原始路径与 `file` / `directory` / `symlink` 类型，按 **Windows 目标规则**
 规范化路径，识别危险条目，并输出同名碰撞组与文件-目录层级冲突；
 符号链接条目额外做**风险分析**：目标越界、链接链循环与祖先路径劫持；
-请求体传 `"repair": true` 还可得到确定性的改名修复计划（`repair_plan`）。
+请求体传 `"repair": true` 还可得到确定性的改名修复计划（`repair_plan`）；
+文件条目可选声明 `compressed_bytes` / `uncompressed_bytes`，并通过
+`resource_limits` 启用**解压资源预算校验**（单文件解压大小、整批解压总量、最大压缩比）。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -54,14 +56,19 @@ pytest -q
 ```json
 {
   "entries": [
-    { "path": "Docs\\ReadMe.txt", "type": "file" },
+    { "path": "Docs\\ReadMe.txt", "type": "file", "compressed_bytes": 512, "uncompressed_bytes": 2048 },
     { "path": "docs/readme.txt", "type": "file" },
     { "path": "../evil.bin", "type": "file" },
     { "path": "a/b", "type": "file" },
     { "path": "a/b/c.txt", "type": "file" },
     { "path": "docs/link", "type": "symlink", "link_target": "../../etc/passwd" }
   ],
-  "repair": false
+  "repair": false,
+  "resource_limits": {
+    "max_uncompressed_bytes_per_file": 1073741824,
+    "max_uncompressed_bytes_total": 10737418240,
+    "max_compression_ratio": 1000
+  }
 }
 ```
 
@@ -71,12 +78,20 @@ pytest -q
 确定性修复计划，见下文 [修复计划（repair=true）](#修复计划repairtrue)。
 响应中的 `entries` **严格保持输入顺序**，`index` 从 1 开始。
 
+仅 `file` 条目可携带非负整数 `compressed_bytes`（压缩后字节数）与
+`uncompressed_bytes`（解压后字节数），两者均可省略；`directory` / `symlink`
+条目携带任一字段返回 422，负数或非整数值同样返回 422。
+`resource_limits` 为可选项，见下文
+[解压资源预算校验（resource_limits）](#解压资源预算校验resource_limits)；
+省略或传空对象 `{}` 时不启用任何限制。
+
 响应关键字段：
 
 | 字段 | 说明 |
 | --- | --- |
 | `entries[].canonical_path` | 规范路径：正斜杠 `/` 分隔、每段 Unicode NFC、段尾空格与句点已裁剪，保留原始大小写用于展示 |
 | `entries[].link_target` | 符号链接目标（仅 `symlink` 条目有值，其余为 `null`） |
+| `entries[].compressed_bytes` / `entries[].uncompressed_bytes` | 回显请求声明的压缩后/解压后字节数（仅 `file` 条目可有值，未声明为 `null`） |
 | `entries[].comparison_key` | Windows 等价比较键（在规范路径上做大小写折叠 `casefold`）；不安全条目为 `null` |
 | `entries[].safe` | 是否可安全解包 |
 | `entries[].collision_group` | 所属同名碰撞组编号，无碰撞为 `null` |
@@ -86,7 +101,7 @@ pytest -q
 | `collision_groups` | 碰撞组明细（含每个成员的下标与规范路径），按首次出现顺序编号 |
 | `hierarchy_conflicts` | `(file_index, descendant_index)` 层级冲突对 |
 | `symlink_analysis` | 符号链接风险分析（见下文），无链接时各列表为空 |
-| `summary` | `total / safe / unsafe / collisions / collision_entries / hierarchy_conflicts / symlinks / symlink_cycles / symlink_hijacked` 计数 |
+| `summary` | `total / safe / unsafe / collisions / collision_entries / hierarchy_conflicts / symlinks / symlink_cycles / symlink_hijacked / total_compressed_bytes / total_uncompressed_bytes / resource_limits_exceeded` 计数 |
 
 curl 示例：
 
@@ -128,6 +143,8 @@ curl -s http://localhost:8000/api/v1/preflight \
 | `LINK_TARGET_INVALID` | 符号链接目标为空、含非法字符或命中保留设备名 |
 | `LINK_CYCLE` | 链接链存在循环，无法解析到最终目标 |
 | `SYMLINK_ANCESTOR` | 文件/目录的祖先路径被符号链接占据（路径劫持） |
+| `UNCOMPRESSED_SIZE_EXCEEDED` | 文件声明的 `uncompressed_bytes` 超过 `max_uncompressed_bytes_per_file` |
+| `COMPRESSION_RATIO_EXCEEDED` | 文件声明压缩比超过 `max_compression_ratio`（整数交叉乘法判定，含压缩为 0、解压大于 0） |
 
 不安全条目仍会返回**尽力而为**的 `canonical_path` 与问题明细，方便展示与修复，
 但**不参与**碰撞分组与层级冲突计算。
@@ -194,6 +211,58 @@ curl -s http://localhost:8000/api/v1/preflight \
   `LINK_CYCLE`；`links` 严格按输入顺序返回。链接条目**不参与**同名碰撞分组
   （同键冲突由链接风险分析覆盖），但仍可作为文件祖先阻挡的后代出现在
   层级冲突中。
+
+## 解压资源预算校验（`resource_limits`）
+
+`file` 条目可声明两个**非负整数**大小字段：`compressed_bytes`（压缩后字节数）与
+`uncompressed_bytes`（解压后字节数），均可省略。请求体可选携带 `resource_limits`
+启用预算校验，各字段省略表示不启用对应限制（整体省略或传 `{}` 时不启用任何限制）：
+
+| 限制字段 | 含义 | 所需文件声明 |
+| --- | --- | --- |
+| `max_uncompressed_bytes_per_file` | 单文件解压大小上限（非负整数） | `uncompressed_bytes` |
+| `max_uncompressed_bytes_total` | 整批文件声明解压总量上限（非负整数） | `uncompressed_bytes` |
+| `max_compression_ratio` | 最大压缩比（**正整数** N，即 N:1） | `compressed_bytes` 与 `uncompressed_bytes` |
+
+校验规则：
+
+1. **单文件解压大小**：`uncompressed_bytes > max_uncompressed_bytes_per_file`
+   时为该文件追加 error 级问题 `UNCOMPRESSED_SIZE_EXCEEDED`（恰好等于上限通过）。
+2. **最大压缩比**：为避免浮点误差，**只用整数交叉乘法**判定
+   `uncompressed_bytes > max_compression_ratio * compressed_bytes`：
+   - 超限追加 error 级问题 `COMPRESSION_RATIO_EXCEEDED`（恰好等于比例通过）；
+   - `compressed_bytes = 0` 且 `uncompressed_bytes > 0`（如 zip 炸弹）时乘积为 0，
+     必然超限；二者均为 `0` 时 `0 > 0` 不成立，**通过**。
+3. **整批解压总量**：累加全部声明了 `uncompressed_bytes` 的文件条目（目录与符号链接
+   无大小语义，不参与），超过 `max_uncompressed_bytes_total` 时仅在 `summary`
+   置批次超限状态，不向单个文件追加问题。
+
+`summary` 中与预算相关的字段（无论是否启用限制都会返回，未声明时总量为 `0`）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `total_compressed_bytes` | 整批文件声明的压缩后字节总量（仅累加声明了该字段的文件） |
+| `total_uncompressed_bytes` | 整批文件声明的解压后字节总量（仅累加声明了该字段的文件） |
+| `resource_limits_exceeded` | 批次超限状态：任一文件命中单文件大小/压缩比限制，或整批总量超限时为 `true`；未启用限制时恒为 `false` |
+
+超限文件的问题码为稳定字符串（见上表），随该文件的 `issues` 返回；
+问题为 **error 级**，因此超限文件 `safe = false`，并与其他不安全条目一样**退出**
+同名碰撞分组、层级冲突检测与 repair 复检（`repair=true` 时按 `UNSAFE` 跳过）。
+
+返回 422 的情形（请求校验阶段，不产生预检结果）：
+
+- `directory` / `symlink` 条目携带 `compressed_bytes` 或 `uncompressed_bytes`；
+- 大小字段为负数或非整数；
+- 启用某项限制后，存在 `file` 条目缺少该限制所需的大小声明（错误信息给出条目下标）；
+- 限制值非法：字节上限为负数、`max_compression_ratio` 小于 1。
+
+curl 示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/preflight \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":[{"path":"big.bin","type":"file","compressed_bytes":3,"uncompressed_bytes":31}],"resource_limits":{"max_uncompressed_bytes_per_file":30,"max_compression_ratio":10}}'
+```
 
 ## 修复计划（`repair=true`）
 
@@ -275,8 +344,9 @@ curl -s http://localhost:8000/api/v1/preflight \
 ├── app/
 │   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis）
-│   ├── service.py       # 碰撞分组、层级冲突与符号链接分析编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 resource_limits、repair_plan、symlink_analysis）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算与符号链接分析编排
+│   ├── resources.py     # 解压资源预算校验：单文件大小、整批总量、压缩比（纯函数，整数交叉乘法）
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例

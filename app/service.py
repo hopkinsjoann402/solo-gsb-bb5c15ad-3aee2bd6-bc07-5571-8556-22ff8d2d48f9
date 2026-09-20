@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
 from .repair import build_repair_plan
+from .resources import evaluate_resource_budget
 from .schemas import (
     CollisionGroup,
     CollisionMember,
@@ -96,6 +97,14 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         for i, e in enumerate(request.entries, start=1)
     ]
 
+    # 解压资源预算校验先于碰撞/层级/符号链接分析：超限文件被追加 error 级问题
+    # 而成为 unsafe，从而退出后续碰撞分组、层级冲突与 repair 复检。
+    sizes = {
+        i: (e.compressed_bytes, e.uncompressed_bytes)
+        for i, e in enumerate(request.entries, start=1)
+    }
+    budget = evaluate_resource_budget(request, normalized)
+
     # 符号链接风险分析先于碰撞/层级检测：被劫持条目会被标记为不安全，
     # 从而退出后续碰撞分组、层级冲突与 repair 复检。
     link_targets = {
@@ -187,6 +196,8 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
             type=EntryType(e.entry_type),
             original_path=e.original_path,
             link_target=link_targets.get(e.index),
+            compressed_bytes=sizes[e.index][0],
+            uncompressed_bytes=sizes[e.index][1],
             canonical_path=e.canonical_path,
             comparison_key=e.comparison_key,
             safe=not e.unsafe,
@@ -208,6 +219,15 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
     ]
 
     unsafe_count = sum(1 for e in normalized if e.unsafe)
+    budget_codes = (
+        IssueCode.UNCOMPRESSED_SIZE_EXCEEDED,
+        IssueCode.COMPRESSION_RATIO_EXCEEDED,
+    )
+    budget_violation_entries = sum(
+        1
+        for e in normalized
+        if any(i.code in budget_codes for i in e.issues)
+    )
     summary = Summary(
         total=len(normalized),
         safe=len(normalized) - unsafe_count,
@@ -218,6 +238,11 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         symlinks=len(symlink_analysis.links),
         symlink_cycles=len(symlink_analysis.cycles),
         symlink_hijacked=len(symlink_analysis.hijacked_entries),
+        total_compressed_bytes=budget.total_compressed_bytes,
+        total_uncompressed_bytes=budget.total_uncompressed_bytes,
+        resource_limits_exceeded=(
+            budget_violation_entries > 0 or budget.total_uncompressed_exceeded
+        ),
     )
 
     if request.repair:
