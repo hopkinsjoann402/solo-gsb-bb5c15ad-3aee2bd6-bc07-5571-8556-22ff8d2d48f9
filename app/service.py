@@ -1,9 +1,10 @@
-"""预检编排：规范化 → 符号链接风险分析 → 同名碰撞分组 → 层级冲突检测（纯内存）。"""
+"""预检编排：规范化 → 符号链接风险分析 → 资源预算校验 → 同名碰撞分组 → 层级冲突检测（纯内存）。"""
 
 from __future__ import annotations
 
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
 from .repair import build_repair_plan
+from .resource import DeclaredSizes, check_resource_budgets
 from .schemas import (
     CollisionGroup,
     CollisionMember,
@@ -104,6 +105,28 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         if e.link_target is not None
     }
     symlink_analysis = analyze_symlinks(normalized, link_targets)
+
+    # 资源预算校验紧随符号链接分析：超限文件被标记为不安全，
+    # 从而退出后续碰撞分组、层级冲突与 repair 复检。
+    limits = request.resource_limits
+    declared_sizes = {
+        i: DeclaredSizes(
+            compressed=e.compressed_bytes, uncompressed=e.uncompressed_bytes
+        )
+        for i, e in enumerate(request.entries, start=1)
+        if e.compressed_bytes is not None or e.uncompressed_bytes is not None
+    }
+    resource_outcome = check_resource_budgets(
+        normalized,
+        declared_sizes,
+        max_file_uncompressed_bytes=(
+            limits.max_file_uncompressed_bytes if limits else None
+        ),
+        max_total_uncompressed_bytes=(
+            limits.max_total_uncompressed_bytes if limits else None
+        ),
+        max_compression_ratio=limits.max_compression_ratio if limits else None,
+    )
 
     index_to_group = _collision_groups(normalized)
 
@@ -218,6 +241,9 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         symlinks=len(symlink_analysis.links),
         symlink_cycles=len(symlink_analysis.cycles),
         symlink_hijacked=len(symlink_analysis.hijacked_entries),
+        declared_compressed_bytes=resource_outcome.declared_compressed_bytes,
+        declared_uncompressed_bytes=resource_outcome.declared_uncompressed_bytes,
+        resource_limits_exceeded=resource_outcome.exceeded,
     )
 
     if request.repair:

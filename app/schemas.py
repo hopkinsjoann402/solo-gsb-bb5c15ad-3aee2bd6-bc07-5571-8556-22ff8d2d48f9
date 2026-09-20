@@ -22,6 +22,16 @@ class PreflightEntryIn(BaseModel):
         default=None,
         description="符号链接目标（type 为 symlink 时必填；file/directory 不得携带）",
     )
+    compressed_bytes: int | None = Field(
+        default=None,
+        ge=0,
+        description="声明的压缩大小（字节，非负；仅 file 条目可携带）",
+    )
+    uncompressed_bytes: int | None = Field(
+        default=None,
+        ge=0,
+        description="声明的解压大小（字节，非负；仅 file 条目可携带）",
+    )
 
     @model_validator(mode="after")
     def _validate_link_target(self) -> "PreflightEntryIn":
@@ -32,6 +42,40 @@ class PreflightEntryIn(BaseModel):
             raise ValueError("仅 symlink 条目可携带 link_target")
         return self
 
+    @model_validator(mode="after")
+    def _validate_declared_sizes(self) -> "PreflightEntryIn":
+        if self.type is not EntryType.FILE and (
+            self.compressed_bytes is not None
+            or self.uncompressed_bytes is not None
+        ):
+            raise ValueError(
+                "仅 file 条目可携带 compressed_bytes/uncompressed_bytes"
+            )
+        return self
+
+
+class ResourceLimits(BaseModel):
+    """可选的解压资源预算；任一字段为 null 表示不启用该项限制。"""
+
+    max_file_uncompressed_bytes: int | None = Field(
+        default=None,
+        ge=0,
+        description="单文件解压大小上限（字节）；启用时每个 file 条目必须提供 uncompressed_bytes",
+    )
+    max_total_uncompressed_bytes: int | None = Field(
+        default=None,
+        ge=0,
+        description="整批解压总量上限（字节）；启用时每个 file 条目必须提供 uncompressed_bytes",
+    )
+    max_compression_ratio: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "最大压缩比（解压大小/压缩大小，整数）；启用时每个 file 条目必须同时提供 "
+            "compressed_bytes 与 uncompressed_bytes"
+        ),
+    )
+
 
 class PreflightRequest(BaseModel):
     entries: list[PreflightEntryIn] = Field(
@@ -41,6 +85,38 @@ class PreflightRequest(BaseModel):
         default=False,
         description="为 true 时生成确定性 repair_plan（同名碰撞与文件祖先冲突修复建议）",
     )
+    resource_limits: ResourceLimits | None = Field(
+        default=None,
+        description="可选的解压资源预算校验；省略时行为与旧版完全一致",
+    )
+
+    @model_validator(mode="after")
+    def _validate_required_sizes(self) -> "PreflightRequest":
+        limits = self.resource_limits
+        if limits is None:
+            return self
+        need_uncompressed = (
+            limits.max_file_uncompressed_bytes is not None
+            or limits.max_total_uncompressed_bytes is not None
+        )
+        need_ratio = limits.max_compression_ratio is not None
+        for index, entry in enumerate(self.entries, start=1):
+            if entry.type is not EntryType.FILE:
+                continue
+            if need_uncompressed and entry.uncompressed_bytes is None:
+                raise ValueError(
+                    f"启用单文件/整批解压大小限制时，文件条目 #{index} "
+                    "必须提供 uncompressed_bytes"
+                )
+            if need_ratio and (
+                entry.compressed_bytes is None
+                or entry.uncompressed_bytes is None
+            ):
+                raise ValueError(
+                    f"启用最大压缩比限制时，文件条目 #{index} 必须同时提供 "
+                    "compressed_bytes 与 uncompressed_bytes"
+                )
+        return self
 
 
 class IssueOut(BaseModel):
@@ -161,6 +237,16 @@ class Summary(BaseModel):
     symlink_cycles: int = Field(..., description="检测到的链接循环组数")
     symlink_hijacked: int = Field(
         ..., description="被符号链接祖先劫持的文件/目录条目数量"
+    )
+    declared_compressed_bytes: int = Field(
+        default=0, description="批次文件条目声明的压缩字节总数"
+    )
+    declared_uncompressed_bytes: int = Field(
+        default=0, description="批次文件条目声明的解压字节总数"
+    )
+    resource_limits_exceeded: bool = Field(
+        default=False,
+        description="任一启用的资源限制（单文件解压大小、整批解压总量、压缩比）被超出时为 true",
     )
 
 

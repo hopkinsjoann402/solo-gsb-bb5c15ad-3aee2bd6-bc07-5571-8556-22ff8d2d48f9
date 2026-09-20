@@ -4,7 +4,9 @@
 接收待解包条目的原始路径与 `file` / `directory` / `symlink` 类型，按 **Windows 目标规则**
 规范化路径，识别危险条目，并输出同名碰撞组与文件-目录层级冲突；
 符号链接条目额外做**风险分析**：目标越界、链接链循环与祖先路径劫持；
-请求体传 `"repair": true` 还可得到确定性的改名修复计划（`repair_plan`）。
+请求体传 `"repair": true` 还可得到确定性的改名修复计划（`repair_plan`）；
+文件条目可声明压缩/解压字节数，配合可选的 `resource_limits` 做**解压资源预算校验**
+（单文件解压大小、整批解压总量、最大压缩比）。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -66,9 +68,13 @@ pytest -q
 ```
 
 `type` 接受 `file`、`directory` 或 `symlink`；`symlink` 条目**必须**携带
-`link_target`，其余类型不得携带（否则返回 422）。`repair` 为可选布尔值，省略或为 `false`
+`link_target`，其余类型不得携带（否则返回 422）。`file` 条目可额外声明非负的
+`compressed_bytes` 与 `uncompressed_bytes`（字节）；`directory` / `symlink`
+携带这两个字段会返回 422。`repair` 为可选布尔值，省略或为 `false`
 时响应与旧版完全一致（不含 `repair_plan` 字段）；为 `true` 时额外返回
 确定性修复计划，见下文 [修复计划（repair=true）](#修复计划repairtrue)。
+可选的 `resource_limits` 启用解压资源预算校验，见下文
+[解压资源预算校验（resource_limits）](#解压资源预算校验resource_limits)。
 响应中的 `entries` **严格保持输入顺序**，`index` 从 1 开始。
 
 响应关键字段：
@@ -86,7 +92,7 @@ pytest -q
 | `collision_groups` | 碰撞组明细（含每个成员的下标与规范路径），按首次出现顺序编号 |
 | `hierarchy_conflicts` | `(file_index, descendant_index)` 层级冲突对 |
 | `symlink_analysis` | 符号链接风险分析（见下文），无链接时各列表为空 |
-| `summary` | `total / safe / unsafe / collisions / collision_entries / hierarchy_conflicts / symlinks / symlink_cycles / symlink_hijacked` 计数 |
+| `summary` | `total / safe / unsafe / collisions / collision_entries / hierarchy_conflicts / symlinks / symlink_cycles / symlink_hijacked` 计数，以及 `declared_compressed_bytes / declared_uncompressed_bytes / resource_limits_exceeded` 资源预算摘要 |
 
 curl 示例：
 
@@ -128,6 +134,8 @@ curl -s http://localhost:8000/api/v1/preflight \
 | `LINK_TARGET_INVALID` | 符号链接目标为空、含非法字符或命中保留设备名 |
 | `LINK_CYCLE` | 链接链存在循环，无法解析到最终目标 |
 | `SYMLINK_ANCESTOR` | 文件/目录的祖先路径被符号链接占据（路径劫持） |
+| `FILE_SIZE_LIMIT_EXCEEDED` | 声明解压大小超过 `resource_limits.max_file_uncompressed_bytes` |
+| `COMPRESSION_RATIO_EXCEEDED` | 声明压缩比超过 `resource_limits.max_compression_ratio`（含压缩 0 字节、解压大于 0 字节的情形） |
 
 不安全条目仍会返回**尽力而为**的 `canonical_path` 与问题明细，方便展示与修复，
 但**不参与**碰撞分组与层级冲突计算。
@@ -194,6 +202,58 @@ curl -s http://localhost:8000/api/v1/preflight \
   `LINK_CYCLE`；`links` 严格按输入顺序返回。链接条目**不参与**同名碰撞分组
   （同键冲突由链接风险分析覆盖），但仍可作为文件祖先阻挡的后代出现在
   层级冲突中。
+
+## 解压资源预算校验（`resource_limits`）
+
+`file` 条目可声明非负的 `compressed_bytes` / `uncompressed_bytes`（字节）；
+请求体传入可选的 `resource_limits` 后，服务基于**声明值**做纯内存的预算校验
+（不访问文件系统）。三项限制各自独立，传 `null` 或省略即不启用：
+
+```json
+{
+  "entries": [
+    { "path": "readme.txt", "type": "file", "compressed_bytes": 120, "uncompressed_bytes": 800 },
+    { "path": "payload.bin", "type": "file", "compressed_bytes": 10, "uncompressed_bytes": 5000 }
+  ],
+  "resource_limits": {
+    "max_file_uncompressed_bytes": 10000,
+    "max_total_uncompressed_bytes": 5000,
+    "max_compression_ratio": 100
+  }
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `max_file_uncompressed_bytes` | 单文件解压大小上限（字节，≥ 0）；超过即为超限 |
+| `max_total_uncompressed_bytes` | 整批解压总量上限（字节，≥ 0）；按全部文件声明的 `uncompressed_bytes` 求和判定 |
+| `max_compression_ratio` | 最大压缩比（整数 ≥ 1），即 `uncompressed_bytes / compressed_bytes` 的上限 |
+
+校验规则：
+
+- **请求校验（422）**：`directory` / `symlink` 条目携带大小字段、大小为负数、
+  或启用了某项限制但某 `file` 条目缺少所需大小（单文件/整批限制需要
+  `uncompressed_bytes`；压缩比限制同时需要 `compressed_bytes` 与
+  `uncompressed_bytes`），均返回 422。目录与符号链接无需声明大小。
+- **压缩比判定**：全程使用**整数交叉乘法**（`uncompressed > ratio × compressed`），
+  不做浮点除法；`compressed_bytes` 为 0 且 `uncompressed_bytes` 大于 0 时视为超限，
+  二者均为 0 时通过。
+- **超限后果**：超限时对应文件条目追加 `error` 级问题码
+  `FILE_SIZE_LIMIT_EXCEEDED` / `COMPRESSION_RATIO_EXCEEDED`，条目随之标记为
+  不安全（退出碰撞分组、层级冲突与 repair 复检）；整批总量超限属于批次级状态，
+  不归属单个条目，仅体现在 `summary.resource_limits_exceeded`。
+- **摘要**：`summary.declared_compressed_bytes` / `declared_uncompressed_bytes`
+  为整批声明字节总数（只要声明了大小就会统计，与是否启用限制无关）；
+  `summary.resource_limits_exceeded` 为批次超限状态（任一启用限制被超出即为
+  `true`）。省略 `resource_limits` 时这些字段以 `0` / `false` 出现，响应保持兼容。
+
+curl 示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/preflight \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":[{"path":"payload.bin","type":"file","compressed_bytes":10,"uncompressed_bytes":5000}],"resource_limits":{"max_compression_ratio":100}}'
+```
 
 ## 修复计划（`repair=true`）
 
@@ -275,9 +335,10 @@ curl -s http://localhost:8000/api/v1/preflight \
 ├── app/
 │   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis）
-│   ├── service.py       # 碰撞分组、层级冲突与符号链接分析编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算与符号链接分析编排
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
+│   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例
 ├── docker/entrypoint.sh # 启动时安装依赖并启动服务
